@@ -4,6 +4,8 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const orderRoutes = require('./routes/orderRoutes');
+const pingRoute = require('./routes/pingRoute');
+const connectUsersDb = require('./utils/usersDbConnection'); // ✅ import user DB connection
 
 dotenv.config();
 
@@ -11,7 +13,7 @@ const app = express();
 const PORT = 5001;
 
 // Middlewares
-app.use(cors({ origin: 'http://192.168.101.3:3001', credentials: true }));
+app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
 app.use(express.json());
 
 app.use((req, res, next) => {
@@ -19,17 +21,27 @@ app.use((req, res, next) => {
   next();
 });
 
-// API Routes
+app.use('/', pingRoute);
 app.use('/api/orders', orderRoutes);
 
-// Connect to MongoDB and start server
+// Connect admin DB first
 mongoose.connect(process.env.DB_URI)
-  .then(() => {
-    console.log('✅ MongoDB connected');
+  .then(async () => {
+    console.log('✅ Admin DB connected');
+
+    // ✅ Connect to Users DB too (only once)
+    try {
+      await connectUsersDb(); // will log its own messages
+    } catch (err) {
+      console.error('❌ Users DB connection failed:', err.message);
+      process.exit(1); // stop if users DB is critical
+    }
+
+    // Start server after both DBs are connected
     app.listen(PORT, () => {
       console.log(`🚀 Server running at http://localhost:${PORT}`);
     });
   })
   .catch((err) => {
-    console.error('❌ MongoDB connection failed:', err);
+    console.error('❌ Admin DB connection failed:', err.message);
   });

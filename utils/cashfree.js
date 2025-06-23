@@ -14,7 +14,7 @@ const createCashfreePayload = (orderId, customer, totalAmount, cart, user_id) =>
       customer_phone: customer.phone,
     },
     order_meta: {
-      return_url: `http://localhost:5173/payment-status?order_id=${orderId}`,
+      return_url: `http://192.168.101.3:3001/payment-status?order_id=${orderId}`,
       payment_methods: 'upi',
       // notify_url: 'https://8d8d-103-186-254-125.ngrok-free.app/api/orders/webhook/cashfree',
     },

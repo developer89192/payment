@@ -21,7 +21,7 @@ const createOrder = async (req, res) => {
     // ✅ Fetch products using same API as COD
     try {
       const productRes = await axios.post(
-        'https://productsdata-lj4d.onrender.com/api/products/by-ids',
+        'https://product.rythuri.in/api/products/by-ids',
         { productIds, pincode },
         { headers: { 'Content-Type': 'application/json' } }
       );

@@ -313,7 +313,7 @@ const createOrderCOD = async (req, res) => {
       paymentStatus: 'not paid',
       paymentMode: 'COD',
       paymentMethod: 'cod',
-      orderStatus: 'confirmed',
+      orderStatus: 'Active',
       deliveryStatus: 'pending',
     });
 

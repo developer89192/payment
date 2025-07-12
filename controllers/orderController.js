@@ -274,16 +274,21 @@ const createOrderCOD = async (req, res) => {
         throw new Error(`Invalid price for product ${item.productId}`);
       }
 
-      if (item.quantity <= 0 || isNaN(item.quantity)) {
+      let quantity = parseFloat(item.quantity);
+      if (isNaN(quantity) || quantity <= 0) {
         throw new Error(`Invalid quantity for product ${item.productId}`);
+      }
+
+      if (matchedProduct.quantity_format === 'weight') {
+        quantity = quantity / 1000; // Convert grams to kg
       }
 
       return {
         productId: matchedProduct._id,
         name: matchedProduct.name,
         price: productPrice,
-        quantity: item.quantity,
-        subtotal: productPrice * item.quantity,
+        quantity,
+        subtotal: productPrice * quantity,
       };
     });
 
@@ -291,8 +296,6 @@ const createOrderCOD = async (req, res) => {
 
     if (totalAmount < 10) {
       return res.status(400).json({ error: 'Minimum order amount for COD is ₹10.' });
-    } else if (totalAmount > 100) {
-      return res.status(400).json({ error: 'COD supports orders under ₹100 only.' });
     }
 
     const orderId = 'COD_' + Date.now();
@@ -320,7 +323,6 @@ const createOrderCOD = async (req, res) => {
     await newOrder.save();
     console.log(`✅ COD Order ${newOrder.orderId} saved to admin DB.`);
 
-    // ✅ Save to users DB
     if (user_id) {
       const userOrderData = {
         orderId: newOrder.orderId,
@@ -365,6 +367,7 @@ const createOrderCOD = async (req, res) => {
     });
   }
 };
+
 
 module.exports = {
   createOrder,

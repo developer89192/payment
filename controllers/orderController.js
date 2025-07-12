@@ -162,7 +162,7 @@ const cashfreeWebhook = async (req, res) => {
     
     if (paymentStatusRaw === 'SUCCESS') {
       paymentStatus = 'paid';
-      orderStatus = 'confirmed';
+      orderStatus = 'Active';
       deliveryStatus = 'pending';
     } else if (paymentStatusRaw === 'FAILED') {
       paymentStatus = 'failed';
@@ -313,7 +313,7 @@ const createOrderCOD = async (req, res) => {
       paymentStatus: 'not paid',
       paymentMode: 'COD',
       paymentMethod: 'cod',
-      orderStatus: 'confirmed',
+      orderStatus: 'Active',
       deliveryStatus: 'pending',
     });
 

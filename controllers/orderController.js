@@ -1,377 +1,408 @@
-// controllers/orderController.js
 const axios = require('axios');
-const { createCashfreePayload, getCashfreeHeaders } = require('../utils/cashfree');
-const { addOrderToUser } = require('./userOrderController'); // ✅ correct
+const { createRazorpayPayload, getRazorpayHeaders, verifyRazorpaySignature } = require('../utils/razorpayUtils');
+const { addOrderToUser } = require('./userOrderController');
+const AdminOrder = require('../models/orderModel');
+const { deliveryCharge, handlingCharge, gstRate, platformCharge } = require('../config/charges.json');
 
-// ======================= CREATE ORDER =======================
-const Order = require('../models/orderModel'); // adjust the path based on your project structure
+const calculateOrderTotals = (subtotalInPaise) => {
+    const delivery = deliveryCharge;
+    const handling = handlingCharge;
+    const gst = subtotalInPaise * gstRate;
+    const platform = platformCharge;
+    const tip = 0;
+    const discount = 0;
 
+    const charges = {
+        delivery,
+        handling,
+        gst: parseFloat(gst.toFixed(2)),
+        platform,
+        tip,
+        discount,
+    };
+    
+    const finalAmount = subtotalInPaise + charges.delivery + charges.handling + charges.gst + charges.platform + charges.tip - charges.discount;
+    console.log(`Subtotal: ₹${subtotalInPaise / 100}, Final Amount (after charges): ₹${finalAmount / 100}`);
+    return {
+        charges,
+        finalAmount: parseFloat(finalAmount.toFixed(2)),
+    };
+};
+
+// ================== CREATE ONLINE ORDER ==================
 const createOrder = async (req, res) => {
-  try {
-    const { cart, customer, user_id, address } = req.body;
-
-    if (!Array.isArray(cart) || cart.length === 0 || !customer || !customer.pincode) {
-      return res.status(400).json({ error: 'Missing cart, customer, or customer pincode in request.' });
-    }
-
-    const pincode = customer.pincode;
-    const productIds = cart.map(item => item.productId);
-    let productsData = [];
-
-    // ✅ Fetch products using same API as COD
     try {
-      const productRes = await axios.post(
-        'https://product.rythuri.in/api/products/by-ids',
-        { productIds, pincode },
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-      productsData = productRes.data;
-    } catch (fetchErr) {
-      console.error(`❌ Error fetching products for pincode ${pincode}:`, fetchErr.response?.data || fetchErr.message);
-      return res.status(500).json({ error: 'Failed to fetch product data.' });
-    }
+        const { cart, customer, user_id, address, deliveryMethod = 'standard', deliveryTime } = req.body;
+        console.log('Received online order details:', req.body);
 
-    if (!Array.isArray(productsData) || productsData.length === 0) {
-      return res.status(404).json({ error: 'No products found for the items in your cart at the specified pincode.' });
-    }
+        if (!Array.isArray(cart) || cart.length === 0 || !customer || !customer.pincode || !address || !deliveryTime) {
+            return res.status(400).json({ error: 'Missing cart, customer, address, or deliveryTime in request.' });
+        }
 
-    const validatedCart = cart.map(item => {
-      const matchedProduct = productsData.find(p => p._id === item.productId);
-      if (!matchedProduct) {
-        throw new Error(`Product not available for pincode ${pincode} or invalid: ${item.productId}`);
-      }
+        const pincode = customer.pincode;
+        const productIds = cart.map(item => item.productId);
+        console.log(`Fetching products for pincode ${pincode} with productIds:`, productIds);
+        let productsData = [];
 
-      const productPrice = parseFloat(matchedProduct.discounted_price);
-      if (isNaN(productPrice) || productPrice < 0) {
-        throw new Error(`Invalid price for product ${item.productId}`);
-      }
+        try {
+            const productRes = await axios.post(
+                'http://192.168.101.2:5000/api/products/by-ids',
+                { productIds, pincode },
+                { headers: { 'Content-Type': 'application/json' } }
+            );
+            productsData = productRes.data;
+            console.log('Products fetched:', productsData);
+        } catch (fetchErr) {
+            console.error(`❌ Error fetching products for pincode ${pincode}:`, fetchErr.response?.data || fetchErr.message);
+            return res.status(500).json({ error: 'Failed to fetch product data.' });
+        }
 
-      if (item.quantity <= 0 || isNaN(item.quantity)) {
-        throw new Error(`Invalid quantity for product ${item.productId}`);
-      }
+        if (!Array.isArray(productsData) || productsData.length === 0) {
+            return res.status(404).json({ error: 'No products found for the items in your cart at the specified pincode.' });
+        }
 
-      return {
-        productId: matchedProduct._id,
-        name: matchedProduct.name,
-        price: productPrice,
-        quantity: item.quantity,
-        subtotal: productPrice * item.quantity,
-      };
-    });
+        let totalPriceInPaise = 0;
+        const validatedItems = [];
 
-    const totalAmount = validatedCart.reduce((sum, item) => sum + item.subtotal, 0);
+        for (const item of cart) {
+            const matchedProduct = productsData.find(p => p._id === item.productId);
+            if (!matchedProduct) {
+                throw new Error(`Product not available for pincode ${pincode} or invalid: ${item.productId}`);
+            }
 
-    if (totalAmount < 10) {
-      return res.status(400).json({ error: 'Minimum order amount is ₹10.' });
-    }
+            const productPricePerUnit = parseFloat(matchedProduct.discounted_price); 
+            if (isNaN(productPricePerUnit) || productPricePerUnit < 0) {
+                throw new Error(`Invalid price for product ${item.productId}`);
+            }
 
-    const orderId = 'ORDER_' + Date.now();
+            const quantity = parseFloat(item.quantity);
+            if (isNaN(quantity) || quantity <= 0) {
+                throw new Error(`Invalid quantity for product ${item.productId}`);
+            }
+            
+            let itemTotalPrice;
+            if (matchedProduct.quantity_format.type === 'weight') {
+                itemTotalPrice = (productPricePerUnit / 1000) * quantity;
+            } else {
+                itemTotalPrice = productPricePerUnit * quantity;
+            }
 
-    const payload = createCashfreePayload(orderId, customer, totalAmount, validatedCart, user_id);
+            totalPriceInPaise += itemTotalPrice;
 
-    const cfRes = await axios.post('https://sandbox.cashfree.com/pg/orders', payload, {
-      headers: getCashfreeHeaders(),
-    });
+            const imageUrl = matchedProduct.images?.[0] || 'https://placehold.co/100x100/E0E0E0/000000?text=No+Image';
 
-    const newOrder = new Order({
-      orderId,
-      cart: validatedCart.map(item => ({
-        productId: item.productId,
-        name: item.name,
-        price: item.price,
-        quantity: item.quantity,
-      })),
-      user_id,
-      customer,
-      address,
-      totalAmount,
-      paymentSessionId: cfRes.data.payment_session_id,
-      paymentStatus: 'pending',
-      paymentMode: null,
-      paymentMethod: 'online',
-      orderStatus: 'created',
-      deliveryStatus: 'pending',
-    });
+            const quantityType = matchedProduct.quantity_format.type;
+            let quantityLabel;
 
-    await newOrder.save();
-    console.log(`✅ Online order ${orderId} saved to admin DB.`);
-
-    // ❌ Do not save to users DB here — will be done in webhook after payment is successful
-
-    return res.json({
-      payment_session_id: cfRes.data.payment_session_id,
-      order_id: orderId,
-    });
-  } catch (err) {
-    console.error('❌ Create Online Order Error:', err.response?.data || err.message);
-    return res.status(500).json({
-      error: 'Failed to create order',
-      details: err.response?.data || err.message,
-    });
-  }
-};
-
-
-
-// ======================= CHECK PAYMENT STATUS =======================
-const getPaymentStatus = async (req, res) => {
-  const { order_id } = req.query;
-  if (!order_id) return res.status(400).json({ error: 'Missing order_id' });
-
-  try {
-    const statusRes = await axios.get(`https://sandbox.cashfree.com/pg/orders/${order_id}`, {
-      headers: getCashfreeHeaders(),
-    });
-
-    const status = statusRes.data.order_status;
-    return res.json({ status: status.toUpperCase() });
-  } catch (err) {
-    console.error('❌ Status Check Error:', err.message);
-    return res.status(500).json({ error: 'Failed to get payment status' });
-  }
-};
-
-// ======================= WEBHOOK (Updated to use direct DB approach) =======================
-const cashfreeWebhook = async (req, res) => {
-  try {
-    const { type, data } = req.body;
-    const orderId = data?.order?.order_id;
-    const paymentStatusRaw = data?.payment?.payment_status;
-    const paymentMethodGroup = data?.payment?.payment_group;
-    
-    let paymentMethodDetails = '';
-    if (paymentMethodGroup === 'upi' && data?.payment?.payment_method?.upi?.upi_id) {
-      paymentMethodDetails = `UPI: ${data.payment.payment_method.upi.upi_id}`;
-    } else if (paymentMethodGroup === 'card' && data?.payment?.payment_method?.card?.card_number) {
-      paymentMethodDetails = `Card: ${data.payment.payment_method.card.card_number}`;
-    } else {
-      paymentMethodDetails = paymentMethodGroup || 'unknown';
-    }
+            if (quantityType === 'weight') {
+                const qtyFromProduct = parseInt(matchedProduct.quantity_format.qty, 10);
+                if (qtyFromProduct && qtyFromProduct > 0) {
+                    const lowerBound = quantity - qtyFromProduct;
+                    quantityLabel = `${lowerBound}-${quantity}gm`;
+                } else {
+                    quantityLabel = `${quantity}gm`;
+                }
+            } else if (quantityType === 'unit') {
+                const qtyFromProduct = parseInt(matchedProduct.quantity_format.qty, 10);
+                if (qtyFromProduct && qtyFromProduct > 0) {
+                    quantityLabel = `${qtyFromProduct} pieces x ${quantity}`;
+                } else {
+                    quantityLabel = `${quantity} piece`;
+                }
+            } else {
+                quantityLabel = `${quantity} piece`;
+            }
+            
+            validatedItems.push({
+                itemId: matchedProduct._id,
+                itemName: matchedProduct.name,
+                imageUrl: imageUrl,
+                price: parseFloat(itemTotalPrice.toFixed(2)), 
+                quantity: item.quantity,
+                quantity_type: quantityType,
+                quantity_label: quantityLabel
+            });
+        }
         
-    console.log(`📦 Webhook received: ${type} for order ${orderId}, status: ${paymentStatusRaw}`);
-    console.log('🔔 Webhook payload:', JSON.stringify(req.body, null, 2));
+        totalPriceInPaise = parseFloat(totalPriceInPaise.toFixed(2));
+        console.log(`Calculated total price (subtotal): ₹${totalPriceInPaise / 100}`);
 
-    if (!orderId || !paymentStatusRaw) {
-      return res.status(400).json({ error: 'Missing required data in webhook payload' });
-    }
-
-    // 1. Translate Cashfree status
-    let paymentStatus = 'pending';
-    let orderStatus = null;
-    let deliveryStatus = null;
-    
-    if (paymentStatusRaw === 'SUCCESS') {
-      paymentStatus = 'paid';
-      orderStatus = 'Active';
-      deliveryStatus = 'pending';
-    } else if (paymentStatusRaw === 'FAILED') {
-      paymentStatus = 'failed';
-      orderStatus = 'cancelled';
-      deliveryStatus = null;
-    }
-
-    // 2. Update order in MongoDB
-    const updatedOrder = await Order.findOneAndUpdate(
-      { orderId },
-      {
-        paymentStatus,
-        paymentMode: paymentMethodGroup || null,
-        orderStatus,
-        deliveryStatus,
-      },
-      { new: true }
-    );
-
-    if (!updatedOrder) {
-      console.warn(`⚠️ No order found for orderId: ${orderId}`);
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    console.log(`✅ Order ${orderId} updated successfully in MongoDB`);
-
-    // 3. ✅ Save to users DB directly (same logic as createOrderCOD)
-    const userId = updatedOrder.user_id?.toString();
-    if (userId && paymentStatusRaw === 'SUCCESS') {
-      const userOrderData = {
-        orderId: updatedOrder.orderId,
-        orderStatus: updatedOrder.orderStatus,
-        paymentStatus: updatedOrder.paymentStatus,
-        paymentMethod: paymentMethodDetails, // Use the formatted payment method
-        deliveryStatus: updatedOrder.deliveryStatus,
-        returnStatus: 'none',
-        items: updatedOrder.cart.map(item => ({
-          itemId: item.productId,
-          itemName: item.name,
-          quantity: item.quantity,
-          price: item.price,
-        })),
-        totalPrice: updatedOrder.totalAmount,
-        orderDate: updatedOrder.createdAt,
-        address: {
-          name: updatedOrder.address?.name || '',
-          apartment: updatedOrder.address?.apartment || '',
-          street: updatedOrder.address?.street || '',
-          type: updatedOrder.address?.type || '',
-          lat: updatedOrder.address?.lat,
-          lon: updatedOrder.address?.lon,
-          pincode: updatedOrder.address?.pincode || '',
-          address: updatedOrder.address?.address || '',
+        if (totalPriceInPaise < 10) {
+            return res.status(400).json({ error: 'Minimum order amount is ₹10.' });
         }
-      };
 
-      try {
-        await addOrderToUser(userId, userOrderData);
-        console.log(`✅ Order ${orderId} also added to user ${userId} directly via addOrderToUser`);
-      } catch (syncErr) {
-        console.error(`❌ Failed to sync order to user DB:`, syncErr.message);
-        // Don't fail the webhook response even if user sync fails
-      }
+        const { charges, finalAmount } = calculateOrderTotals(totalPriceInPaise);
+        const orderId = 'ORDER_' + Date.now();
+        const currentOrderDate = new Date();
+        
+        console.log('Order ID:', orderId);
+
+        const payload = createRazorpayPayload(orderId, finalAmount);
+        console.log('Payload sent to Razorpay:', payload);
+
+        const razorpayRes = await axios.post(
+            'https://api.razorpay.com/v1/orders',
+            payload,
+            {
+                auth: {
+                    username: process.env.RAZORPAY_KEY_ID,
+                    password: process.env.RAZORPAY_KEY_SECRET,
+                },
+                headers: getRazorpayHeaders(),
+            }
+        );
+        console.log('Razorpay response:', razorpayRes.data);
+
+        const newAdminOrder = new AdminOrder({
+            orderId,
+            items: validatedItems,
+            userId: user_id,
+            address: {
+                name: address.customer_name,
+                apartment: address.apartment,
+                street: address.street,
+                type: address.address_type,
+                lat: address.lat,
+                lon: address.lon,
+                pincode: address.pincode,
+                address: address.full_address,
+            },
+            totalPrice: totalPriceInPaise,
+            charges,
+            finalAmount,
+            paymentStatus: 'not_paid',
+            paymentMethod: 'online',
+            orderStatus: 'placed',
+            deliveryMethod: deliveryMethod,
+            selectedDeliverySlot: deliveryTime,
+            orderDate: currentOrderDate,
+            returnStatus: 'none',
+            razorpayOrderId: razorpayRes.data.id,
+            customer: {
+                name: address.customer_name || "test",
+                number: customer.phone,
+            },
+        });
+
+        await newAdminOrder.save();
+        console.log(`✅ Online order ${orderId} saved to admin DB.`);
+
+        return res.json({
+            razorpay_order_id: razorpayRes.data.id,
+            order_id: orderId,
+            amount: (razorpayRes.data.amount / 100),
+            currency: razorpayRes.data.currency,
+            key_id: process.env.RAZORPAY_KEY_ID,
+        });
+    } catch (err) {
+        console.error('❌ Create Online Order Error:', err.response?.data || err.message);
+        return res.status(500).json({
+            error: 'Failed to create order',
+            details: err.response?.data || err.message,
+        });
     }
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error('❌ Webhook error:', err);
-    return res.sendStatus(500);
-  }
 };
-
-const createOrderCOD = async (req, res) => {
-  try {
-    const { cart, customer, user_id, address } = req.body;
-
-    if (!Array.isArray(cart) || cart.length === 0 || !customer || !customer.pincode) {
-      return res.status(400).json({ error: 'Missing cart, customer, or customer pincode in request.' });
-    }
-
-    const pincode = customer.pincode;
-    const productIds = cart.map(item => item.productId);
-    let productsData = [];
-
+// ================== PAYMENT VERIFICATION (Razorpay) ==================
+const verifyPayment = async (req, res) => {
     try {
-      const productRes = await axios.post(
-        'https://product.rythuri.in/api/products/by-ids',
-        { productIds, pincode },
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-      productsData = productRes.data;
-    } catch (fetchErr) {
-      console.error(`❌ Error fetching products for pincode ${pincode}:`, fetchErr.response?.data || fetchErr.message);
-      return res.status(500).json({ error: 'Failed to fetch product data.' });
-    }
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, order_id } = req.body;
+        console.log('Payment verification details:', req.body);
 
-    if (!Array.isArray(productsData) || productsData.length === 0) {
-      return res.status(404).json({ error: 'No products found for the items in your cart at the specified pincode.' });
-    }
-
-    const validatedCart = cart.map(item => {
-      const matchedProduct = productsData.find(p => p._id === item.productId);
-      if (!matchedProduct) {
-        throw new Error(`Product not available for pincode ${pincode} or invalid: ${item.productId}`);
-      }
-
-      const productPrice = parseFloat(matchedProduct.discounted_price);
-      if (isNaN(productPrice) || productPrice < 0) {
-        throw new Error(`Invalid price for product ${item.productId}`);
-      }
-
-      let quantity = parseFloat(item.quantity);
-      if (isNaN(quantity) || quantity <= 0) {
-        throw new Error(`Invalid quantity for product ${item.productId}`);
-      }
-
-      if (matchedProduct.quantity_format === 'weight') {
-        quantity = quantity / 1000; // Convert grams to kg
-      }
-
-      return {
-        productId: matchedProduct._id,
-        name: matchedProduct.name,
-        price: productPrice,
-        quantity,
-        subtotal: productPrice * quantity,
-      };
-    });
-
-    const totalAmount = validatedCart.reduce((sum, item) => sum + item.subtotal, 0);
-
-    if (totalAmount < 10) {
-      return res.status(400).json({ error: 'Minimum order amount for COD is ₹10.' });
-    }
-
-    const orderId = 'COD_' + Date.now();
-
-    const newOrder = new Order({
-      orderId,
-      cart: validatedCart.map(item => ({
-        productId: item.productId,
-        name: item.name,
-        price: item.price,
-        quantity: item.quantity,
-      })),
-      user_id,
-      customer,
-      address,
-      totalAmount,
-      paymentSessionId: null,
-      paymentStatus: 'not paid',
-      paymentMode: 'COD',
-      paymentMethod: 'cod',
-      orderStatus: 'Active',
-      deliveryStatus: 'pending',
-    });
-
-    await newOrder.save();
-    console.log(`✅ COD Order ${newOrder.orderId} saved to admin DB.`);
-
-    if (user_id) {
-      const userOrderData = {
-        orderId: newOrder.orderId,
-        orderStatus: newOrder.orderStatus,
-        paymentStatus: newOrder.paymentStatus,
-        paymentMethod: newOrder.paymentMethod,
-        deliveryStatus: newOrder.deliveryStatus,
-        returnStatus: 'none',
-        items: newOrder.cart.map(item => ({
-          itemId: item.productId,
-          itemName: item.name,
-          quantity: item.quantity,
-          price: item.price,
-        })),
-        totalPrice: newOrder.totalAmount,
-        orderDate: newOrder.createdAt,
-        address: {
-          name: newOrder.address?.name || '',
-          apartment: newOrder.address?.apartment || '',
-          street: newOrder.address?.street || '',
-          type: newOrder.address?.type || '',
-          lat: newOrder.address?.lat,
-          lon: newOrder.address?.lon,
-          pincode: newOrder.address?.pincode || '',
-          address: newOrder.address?.address || '',
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !order_id) {
+            return res.status(400).json({ error: 'Missing payment verification data' });
         }
-      };
 
-      await addOrderToUser(user_id, userOrderData);
+        const isValid = verifyRazorpaySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature);
+        console.log(`Payment signature valid: ${isValid}`);
+
+        if (!isValid) {
+            return res.status(400).json({ error: 'Invalid payment signature' });
+        }
+
+        const adminOrder = await AdminOrder.findOne({ orderId: order_id });
+        if (!adminOrder) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+
+        console.log(`Updating order status for Order ID: ${order_id}`);
+        adminOrder.paymentStatus = 'paid';
+        adminOrder.orderStatus = 'processing';
+        adminOrder.updatedAt = new Date();
+        await adminOrder.save();
+
+        const userId = adminOrder.userId?.toString();
+        if (userId) {
+            await addOrderToUser(userId, adminOrder);
+        }
+
+        return res.json({ success: true, message: 'Payment verified and order updated.' });
+    } catch (err) {
+        console.error('❌ Payment Verification Error:', err.message);
+        return res.status(500).json({ error: 'Payment verification failed' });
     }
-
-    return res.json({
-      message: 'COD order placed successfully',
-      order_id: orderId,
-      total_amount: totalAmount
-    });
-  } catch (err) {
-    console.error('❌ Create COD Order Error:', err.message);
-    return res.status(500).json({
-      error: 'Failed to create COD order.',
-      details: err.message,
-    });
-  }
 };
 
+// ======================= CREATE ORDER (COD) =======================
+const createOrderCOD = async (req, res) => {
+    try {
+        const { cart, customer, user_id, address, deliveryMethod = 'standard', deliveryTime } = req.body;
+        console.log('Received COD order details:', req.body);
+
+        if (!Array.isArray(cart) || cart.length === 0 || !customer || !customer.pincode || !address || !deliveryTime) {
+            return res.status(400).json({ error: 'Missing cart, customer, address, or deliveryTime in request.' });
+        }
+
+        const pincode = customer.pincode;
+        const productIds = cart.map(item => item.productId);
+        console.log(`Fetching products for pincode ${pincode} with productIds:`, productIds);
+        let productsData = [];
+
+        try {
+            const productRes = await axios.post(
+                'http://192.168.101.2:5000/api/products/by-ids',
+                { productIds, pincode },
+                { headers: { 'Content-Type': 'application/json' } }
+            );
+            productsData = productRes.data;
+            console.log('Products fetched:', productsData);
+        } catch (fetchErr) {
+            console.error(`❌ Error fetching products for pincode ${pincode}:`, fetchErr.response?.data || fetchErr.message);
+            return res.status(500).json({ error: 'Failed to fetch product data.' });
+        }
+
+        if (!Array.isArray(productsData) || productsData.length === 0) {
+            return res.status(404).json({ error: 'No products found for the items in your cart at the specified pincode.' });
+        }
+
+        let totalPriceInPaise = 0;
+        const validatedItems = [];
+
+        for (const item of cart) {
+            const matchedProduct = productsData.find(p => p._id === item.productId);
+            if (!matchedProduct) {
+                throw new Error(`Product not available for pincode ${pincode} or invalid: ${item.productId}`);
+            }
+
+            const productPricePerUnit = parseFloat(matchedProduct.discounted_price); 
+            if (isNaN(productPricePerUnit) || productPricePerUnit < 0) {
+                throw new Error(`Invalid price for product ${item.productId}`);
+            }
+
+            let quantity = parseFloat(item.quantity);
+            if (isNaN(quantity) || quantity <= 0) {
+                throw new Error(`Invalid quantity for product ${item.productId}`);
+            }
+
+            let itemTotalPrice;
+            if (matchedProduct.quantity_format.type === 'weight') {
+                itemTotalPrice = (productPricePerUnit / 1000) * quantity;
+            } else {
+                itemTotalPrice = productPricePerUnit * quantity;
+            }
+            
+            totalPriceInPaise += itemTotalPrice;
+
+            const imageUrl = matchedProduct.images?.[0] || 'https://placehold.co/100x100/E0E0E0/000000?text=No+Image';
+            
+            const quantityType = matchedProduct.quantity_format.type;
+            let quantityLabel;
+
+            if (quantityType === 'weight') {
+                const qtyFromProduct = parseInt(matchedProduct.quantity_format.qty, 10);
+                if (qtyFromProduct && qtyFromProduct > 0) {
+                    const lowerBound = quantity - qtyFromProduct;
+                    quantityLabel = `${lowerBound}-${quantity}gm`;
+                } else {
+                    quantityLabel = `${quantity}gm`;
+                }
+            } else if (quantityType === 'unit') {
+                const qtyFromProduct = parseInt(matchedProduct.quantity_format.qty, 10);
+                if (qtyFromProduct && qtyFromProduct > 0) {
+                    quantityLabel = `${qtyFromProduct} pieces x ${quantity}`;
+                } else {
+                    quantityLabel = `${quantity} piece`;
+                }
+            } else {
+                quantityLabel = `${quantity} piece`;
+            }
+            
+            validatedItems.push({
+                itemId: matchedProduct._id,
+                itemName: matchedProduct.name,
+                imageUrl: imageUrl,
+                price: parseFloat(itemTotalPrice.toFixed(2)), 
+                quantity: item.quantity,
+                quantity_type: quantityType,
+                quantity_label: quantityLabel
+            });
+        }
+
+        totalPriceInPaise = parseFloat(totalPriceInPaise.toFixed(2));
+        console.log(`Calculated total price (subtotal): ₹${totalPriceInPaise / 100}`);
+
+        if (totalPriceInPaise < 10) {
+            return res.status(400).json({ error: 'Minimum order amount for COD is ₹10.' });
+        }
+
+        const { charges, finalAmount } = calculateOrderTotals(totalPriceInPaise);
+        const orderId = 'COD_' + Date.now();
+        const currentOrderDate = new Date();
+        console.log('Order ID:', orderId);
+
+        const newAdminOrder = new AdminOrder({
+            orderId,
+            items: validatedItems,
+            userId: user_id,
+            address: {
+                name: address.customer_name,
+                apartment: address.apartment,
+                street: address.street,
+                type: address.address_type,
+                lat: address.lat,
+                lon: address.lon,
+                pincode: address.pincode,
+                address: address.full_address,
+            },
+            totalPrice: totalPriceInPaise,
+            charges,
+            finalAmount,
+            paymentStatus: 'not_paid',
+            paymentMethod: 'cod',
+            orderStatus: 'placed',
+            deliveryMethod: deliveryMethod,
+            selectedDeliverySlot: deliveryTime,
+            orderDate: currentOrderDate,
+            returnStatus: 'none',
+            customer: {
+                name: address.customer_name,
+                number: customer.phone,
+            },
+        });
+
+        await newAdminOrder.save();
+        console.log(`✅ COD Order ${newAdminOrder.orderId} saved to admin DB.`);
+
+        if (user_id) {
+            await addOrderToUser(user_id, newAdminOrder);
+            console.log(`✅ COD Order ${newAdminOrder.orderId} also added to user ${user_id}`);
+        }
+
+        return res.json({
+            message: 'COD order placed successfully',
+            order_id: orderId,
+            total_amount: finalAmount / 100
+        });
+    } catch (err) {
+        console.error('❌ Create COD Order Error:', err.message);
+        return res.status(500).json({
+            error: 'Failed to create COD order.',
+            details: err.message,
+        });
+    }
+};
 
 module.exports = {
-  createOrder,
-  getPaymentStatus,
-  cashfreeWebhook,
-  createOrderCOD // 👈 Export the new handler
+    createOrder,
+    verifyPayment,
+    createOrderCOD
 };

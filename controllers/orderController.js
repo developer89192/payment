@@ -127,7 +127,7 @@ const createOrder = async (req, res) => {
         totalPriceInPaise = parseFloat(totalPriceInPaise.toFixed(2));
         console.log(`Calculated total price (subtotal): ₹${totalPriceInPaise / 100}`);
 
-        if (totalPriceInPaise < 10) {
+        if (totalPriceInPaise < 1) {
             return res.status(400).json({ error: 'Minimum order amount is ₹10.' });
         }
 

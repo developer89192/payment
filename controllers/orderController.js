@@ -46,7 +46,7 @@ const createOrder = async (req, res) => {
 
         try {
             const productRes = await axios.post(
-                'http://192.168.101.2:5000/api/products/by-ids',
+                'https://product.rythuri.in/api/products/by-ids',
                 { productIds, pincode },
                 { headers: { 'Content-Type': 'application/json' } }
             );
@@ -259,7 +259,7 @@ const createOrderCOD = async (req, res) => {
 
         try {
             const productRes = await axios.post(
-                'http://192.168.101.2:5000/api/products/by-ids',
+                'https://product.rythuri.in/api/products/by-ids',
                 { productIds, pincode },
                 { headers: { 'Content-Type': 'application/json' } }
             );
